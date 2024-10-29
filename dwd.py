@@ -3,7 +3,7 @@ import os
 from tqdm import tqdm
 
 import ray
-from utils import compute_snr
+from utils import compute_snr, calculate_required_bits
 from raynest.parameter import LivePoint
 from raynest.model import Model
 from tdggs import Evolutioner
@@ -13,12 +13,13 @@ class DWD(Model):
     """
     def __init__(self, time, data, signal_model, kwargs):
         self.time   = time
+        self.dt     = np.diff(self.time)[0]
         self.data   = data
         self.signal = signal_model
         self.sigma  = kwargs['sigma_noise']
         self.names=['logA','logf','logfdot','phi']
 #        self.bounds=[[-56,-50],[np.log(1./kwargs['T']),np.log(kwargs['srate']/2.)],[0.0,2*np.pi]]
-        self.bounds=[[-56,-50],[-9.5,-5],[-50,-28],[0.0,2*np.pi]]
+        self.bounds=[[-56,-50],[np.log(1./kwargs['T']),np.log(kwargs['srate']/2.)],[-50,-28],[0.0,2*np.pi]]
 
     def log_likelihood(self, population):
         """
@@ -38,14 +39,14 @@ class DWD(Model):
     
     def log_posterior(self, population):
         logP = 0.0
-#        for p in population:
-#            if not(np.isfinite(super(DWD,self).log_prior(p))):
-#                return -np.inf
+        for p in population:
+            if not(np.isfinite(super(DWD,self).log_prior(p))):
+                return -np.inf
 
         return logP+self.log_likelihood(population)
 
 if __name__ == "__main__":
-    file = "/Users/wdp/Documents/projects_ongoing/genetic_search/galactic_data/DWD_pop_agCE_Pmax025d_KroupaIMF_BPsfh_inputLDC.hdf5"
+    file = "DWD_pop_agCE_Pmax025d_KroupaIMF_BPsfh_inputLDC.hdf5"
     import h5py
     
     sampling_parameters_names = ['Amplitude',
@@ -63,13 +64,13 @@ if __name__ == "__main__":
     from waveforms import sinusoid, logfdot
     import matplotlib.pyplot as plt
     from ray.experimental import tqdm_ray
-    
+
     ray.init()
-    Nsig  = 10000
-    sigma_noise = 1e-22
+    Nsig  = 1
+    sigma_noise = 1e-24
     n_chunk = 1
-    ndays   = 7
-    decimation_factor = 1
+    ndays   = 1
+    decimation_factor = 20
     zero_noise = 1
     chunk_duration = ndays*86500
     rng = np.random.default_rng(314)
@@ -94,6 +95,14 @@ if __name__ == "__main__":
     injection_parameters[:,0] = np.log(injection_parameters[:,0])
     injection_parameters[:,1] = np.log(injection_parameters[:,1])
     injection_parameters[:,2] = np.log(injection_parameters[:,2])
+
+    precision    = srate/Npts
+    max_value    = srate/2.
+
+    Ngenerations = 100000
+    n_bits       = calculate_required_bits(precision, max_value)
+    print("Will run using {} bits".format(n_bits))
+
 #    
 #    from scipy.stats import linregress
 #    plt.plot(injection_parameters[:,1],injection_parameters[:,2],'o')
@@ -106,7 +115,7 @@ if __name__ == "__main__":
 #    
     
     injected_signals = [sinusoid(time, pi) for pi in injection_parameters]
-    snrs = [compute_snr(inj, sigma_noise) for inj in injected_signals]
+    snrs = [compute_snr(inj, sigma_noise, T) for inj in injected_signals]
     fig = plt.figure()
     ax  = fig.add_subplot(111)
 #        ax.plot(ti,noise,'r',alpha=0.5,label='noise')
@@ -128,6 +137,7 @@ if __name__ == "__main__":
     ax  = fig.add_subplot(111)
 #        ax.plot(ti,noise,'r',alpha=0.5,label='noise')
     ax.plot(time,data,'b',alpha=0.5,label ='signals')
+    ax.plot(time,sig,'r',alpha=0.5,label ='signals')
 #    ax.plot(ti,di,'k',alpha=0.5,label ='data')
 #    ax.plot(ti,np.sum([sinusoid(ti, pi.values) for pi in recovered_values],axis=0),linestyle = 'dashed', color='purple',alpha=0.5,lw=1.5,label='recovered')
 #    plt.legend()
@@ -135,24 +145,17 @@ if __name__ == "__main__":
     plt.ylabel('strain')
     plt.savefig(output_folder+'/data_{0:d}.pdf'.format(11),bbox_inches='tight')
         
-    exit()
-    
     jobs = []
     
     for i,ti,di,si in zip(range(n_chunk),t,d,s):#tqdm_ray.tqdm(,desc='chunk'):
         M    = DWD(ti, di, sinusoid, {'sigma_noise':sigma_noise, 'T':chunk_duration,'srate':srate,'min_amp':min_amp})
-#        print("bounds = ", M.bounds)
-#        print(np.min(freqs), np.max(freqs))
-#        print(np.min(amps), np.max(amps))
-#        exit()
-        E    = Evolutioner.remote(M, seed = 666+i, n=1, mode='sample', burnin=0.75, output = os.path.join(output_folder,'chunk_{0:d}'.format(i)), position=i)
+
+        E    = Evolutioner.remote(M, seed = 666+i, n=1, mode='sample', num_bits = n_bits, burnin=0.5, output = os.path.join(output_folder,'chunk_{0:d}'.format(i)), position=i)
         
-        maxL = np.sum(-0.5*(di-si)**2/sigma_noise**2)-di.shape[0]*np.log(2*np.pi*sigma_noise**2)/2
-        print(maxL,np.sum(-0.5*(di)**2/sigma_noise**2)-di.shape[0]*np.log(2*np.pi*sigma_noise**2)/2)
+        maxL = np.sum(-0.5*(di-si)**2/(sigma_noise)**2)-di.shape[0]*np.log(2*np.pi*(sigma_noise)**2)/2
+        print("maximum likelihood = {}".format(maxL))
         
-        jobs.append(E.evolve.remote(n_generations = 100000))
-        maxL = np.sum(-0.5*(di-si)**2/sigma_noise**2)
-        print(maxL,np.sum(-0.5*(di)**2/sigma_noise**2))
+        jobs.append(E.evolve.remote(n_generations = Ngenerations))
     
     results = ray.get(jobs)
     ray.shutdown()
@@ -173,28 +176,28 @@ if __name__ == "__main__":
         plt.ylabel('strain')
         plt.savefig(output_folder+'/data_{0:d}.pdf'.format(i),bbox_inches='tight')
         
-        nbins   = int(np.sqrt(len(recovered_values)))
-        nbins_t = int(np.sqrt(Nsig))
+        nbins   = 100
+        nbins_t = 100
         
         fig = plt.figure()
         ax  = fig.add_subplot(411)
-        ax.hist([pi['logf'] for pi in recovered_values], density = True, facecolor='purple', alpha = 0.5, bins = nbins)
-        ax.hist(injection_parameters[:,1], density = True, alpha = 0.5, facecolor='black', bins = nbins_t)
+        ax.hist([pi['logf'] for pi in recovered_values], density = True, facecolor='purple', alpha = 0.5, bins = np.linspace(M.bounds[1][0],M.bounds[1][1],nbins))
+        ax.hist(injection_parameters[:,1], density = True, alpha = 0.5, facecolor='black', bins = np.linspace(M.bounds[1][0],M.bounds[1][1],nbins))
         ax.set_xlabel('frequency(Hz)')
         ax.set_xlim(M.bounds[1][0],M.bounds[1][1])
         ax = fig.add_subplot(412)
-        ax.hist([pi['phi'] for pi in recovered_values], facecolor='purple', density = True, bins = nbins)
-        ax.hist(injection_parameters[:,3], density = True, alpha = 0.5, facecolor='black', bins = nbins_t)
+        ax.hist([pi['phi'] for pi in recovered_values], facecolor='purple', density = True, bins = np.linspace(M.bounds[3][0],M.bounds[3][1],nbins))
+        ax.hist(injection_parameters[:,3], density = True, alpha = 0.5, facecolor='black', bins = np.linspace(M.bounds[3][0],M.bounds[3][1],nbins))
         ax.set_xlabel('phase')
         ax.set_xlim(M.bounds[3][0],M.bounds[3][1])
         ax = fig.add_subplot(413)
-        ax.hist([pi['logA'] for pi in recovered_values], facecolor='purple', density = True, bins = nbins)
-        ax.hist(injection_parameters[:,0], density = True, alpha = 0.5, facecolor='black', bins = nbins_t)
+        ax.hist([pi['logA'] for pi in recovered_values], facecolor='purple', density = True, bins = np.linspace(M.bounds[0][0],M.bounds[0][1],nbins))
+        ax.hist(injection_parameters[:,0], density = True, alpha = 0.5, facecolor='black', bins = np.linspace(M.bounds[0][0],M.bounds[0][1],nbins))
         ax.set_xlabel('amplitude')
         ax.set_xlim(M.bounds[0][0],M.bounds[0][1])
         ax = fig.add_subplot(414)
-        ax.hist([pi['logfdot'] for pi in recovered_values], facecolor='purple', density = True, bins = nbins)
-        ax.hist(injection_parameters[:,2], density = True, alpha = 0.5, facecolor='black', bins = nbins_t)
+        ax.hist([pi['logfdot'] for pi in recovered_values], facecolor='purple', density = True, bins = np.linspace(M.bounds[2][0],M.bounds[2][1],nbins))
+        ax.hist(injection_parameters[:,2], density = True, alpha = 0.5, facecolor='black', bins = np.linspace(M.bounds[2][0],M.bounds[2][1],nbins))
         ax.set_xlabel('log fdot')
         ax.set_xlim(M.bounds[2][0],M.bounds[2][1])
         plt.subplots_adjust(hspace=0.6)
@@ -202,17 +205,23 @@ if __name__ == "__main__":
         
         from postprocess import read_samples
         
-        file = "/Users/wdp/Documents/projects_ongoing/genetic_search/TDGGS/quick_run/chunk_0/samples.h5"
+        file = os.path.join(output_folder,"chunk_{}/samples.h5".format(i))
 
         p = read_samples(file)
         N = len(p)
         print("N samples = ",N)
         
+        # pick 100 random subsamples
+        Nsub = 100
+        idx = rng.integers(N, size = Nsub)
+        
         fig = plt.figure()
         ax  = fig.add_subplot(111)
         ax.scatter(injection_parameters[:,1],injection_parameters[:,0],color='turquoise',alpha=0.5,label='injection')
-        for k in tqdm(range(N)):
-            ax.scatter(p[k][:,1], p[k][:,0],color='purple',s=1,marker='o',rasterized=True, alpha=0.5)
+        
+         
+        for k in tqdm(range(Nsub),desc='scattering A - f'):
+            ax.scatter(p[idx[k]][:,1], p[idx[k]][:,0],color='purple',s=1,marker='o',rasterized=True, alpha=0.5)
         ax.set_ylabel('log(amplitude)')
         ax.set_xlabel('log(frequency(Hz))')
         ax.set_xlim(M.bounds[1][0],M.bounds[1][1])
@@ -224,8 +233,8 @@ if __name__ == "__main__":
         fig = plt.figure()
         ax  = fig.add_subplot(111)
         ax.scatter(injection_parameters[:,1],injection_parameters[:,2],color='turquoise',alpha=0.5,label='injection')
-        for k in tqdm(range(N)):
-            ax.scatter(p[k][:,1], p[k][:,2],color='purple',s=1,marker='o',rasterized=True, alpha=0.5)
+        for k in tqdm(range(Nsub),desc='scattering f - fdot'):
+            ax.scatter(p[idx[k]][:,1], p[idx[k]][:,2],color='purple',s=1,marker='o',rasterized=True, alpha=0.5)
         ax.set_ylabel('log(fdot)')
         ax.set_xlabel('log(frequency(Hz))')
         ax.set_xlim(M.bounds[1][0],M.bounds[1][1])

@@ -1,28 +1,8 @@
 import numpy as np
+import math
 
-def compute_snr(h,sigma):
-    return np.sqrt(np.sum(h**2/sigma**2)/2.)
-    
-# decode bitstring to numbers
-def decode(bounds, n_bits, bitstring):
-    """
-    take a string of bits and translate it into a real number
-    """
-    decoded = list()
-    largest = 2**n_bits
-    for i in range(len(bounds)):
-        # extract the substring
-        start, end = i * n_bits, (i * n_bits)+n_bits
-        substring = bitstring[start:end]
-        # convert bitstring to a string of chars
-        chars = ''.join([str(s) for s in substring])
-        # convert string to integer
-        integer = int(chars, 2)
-        # scale integer to desired range
-        value = bounds[i][0] + (integer/largest) * (bounds[i][1] - bounds[i][0])
-        # store
-        decoded.append(value)
-    return decoded
+def compute_snr(h,sigma,T):
+    return np.sqrt(np.sum(h**2/sigma**2)/T)
 
 # mutation operator
 def mutation(genome, r_mut, rng):
@@ -53,3 +33,21 @@ def survive(x, rng):
     """
     """
     return x
+    
+def calculate_required_bits(precision, max_value):
+    """
+    Calculate the number of bits required to represent a value with a given precision.
+
+    :param precision: The desired precision.
+    :param max_value: The maximum value to represent.
+    :return: The number of bits required.
+    """
+    if precision <= 0:
+        raise ValueError("Precision must be greater than 0.")
+    if max_value <= 0:
+        raise ValueError("Max value must be greater than 0.")
+
+    # Calculate the number of bits required
+    required_bits = math.ceil(math.log2(max_value / precision))
+
+    return required_bits

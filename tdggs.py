@@ -9,18 +9,65 @@ import numpy as np
 import ray
 from raynest.parameter import LivePoint
 from raynest.model import Model
-from utils import decode
 import struct
 import h5py
 
-def bin2float(b):
-    ''' Convert binary string to a float.
+def map_to_bit_string(value, lower_bound, upper_bound, num_bits):
+    """
+    Maps a real value from the interval [lower_bound, upper_bound]
+    to a byte string with a fixed number of bits.
 
-    Attributes:
-        :b: Binary string to transform.
-    '''
-    h = int(b,2).to_bytes(8, byteorder="big")
-    return struct.unpack('>d', h)[0]
+    :param value: The real value to map.
+    :param lower_bound: The lower bound of the interval.
+    :param upper_bound: The upper bound of the interval.
+    :param num_bits: The number of bits for the byte string.
+    :return: A byte string representation of the mapped value.
+    """
+    # Check that the value is within the specified bounds
+    if not (lower_bound <= value <= upper_bound):
+        raise ValueError(f"Value {value} is out of bounds ({lower_bound}, {upper_bound})")
+
+    # Calculate the range and scale the value to [0, 2^num_bits - 1]
+    range_size = upper_bound - lower_bound
+    scaled_value = int((value - lower_bound) / range_size * (2**num_bits - 1))
+
+    # Convert to a byte string
+    bit_string = format(scaled_value, f'0{num_bits}b')
+
+    return bit_string
+
+def map_bit_string_to_real(bit_string, lower_bound, upper_bound, num_bits):
+    """
+    Maps a bit string with a fixed number of bits back to a real interval [lower_bound, upper_bound].
+
+    :param bit_string: The bit string to map.
+    :param lower_bound: The lower bound of the interval.
+    :param upper_bound: The upper bound of the interval.
+    :return: The mapped real value.
+    """
+    # Convert the bit string to an integer
+    integer_value = int(bit_string, 2)
+
+    # Normalize the integer to the range [0, 2^num_bits - 1]
+    range_size = 2**num_bits - 1
+
+    # Scale the normalized value to the interval [lower_bound, upper_bound]
+    scaled_value = lower_bound + (integer_value / range_size) * (upper_bound - lower_bound)
+
+    return scaled_value
+
+def bin2float(binary_string):
+
+    # Convert binary string to an integer
+    integer_representation = int(binary_string, 2)
+    
+    # Pack the integer into bytes, assuming it's a 64-bit float
+    byte_data = struct.pack('>Q', integer_representation)  # '>I' for big-endian unsigned int
+    
+    # Unpack the bytes as a float
+    double_number = struct.unpack('>d', byte_data)[0]  # '>f' for big-endian float
+    
+    return double_number
 
 def float2bin(f):
     ''' Convert float to 64-bit binary string.
@@ -28,35 +75,70 @@ def float2bin(f):
     Attributes:
         :f: Float number to transform.
     '''
-    [d] = struct.unpack(">Q", struct.pack(">d", f))
-    return f'{d:064b}'
+    byte_data = struct.pack('>d', f)
+    binary_string = ''.join(f'{byte:08b}' for byte in byte_data)
+    
+    return binary_string
 
-def search_rule(a,b,*args,**kwargs):
-    if a > b:
+def search_rule(a, b, rng, death_rate, birth_rate, mutation_rate, move):
+
+    p_t = log_transition_probabilities(death_rate, birth_rate, mutation_rate, move)
+
+    if a-b + p_t > 0:
         return True
     return False
 
-def metropolis_hastings(a,b,rng,*args,**kwargs):
-    if a - b > np.log(rng.uniform(0,1)):
+def metropolis_hastings(a, b, rng, death_rate, birth_rate, mutation_rate, move):
+
+    p_t = log_transition_probabilities(death_rate, birth_rate, mutation_rate, move)
+
+    if (a-b + p_t) > np.log(rng.uniform(0,1)):
         return True
     return False
+
+
+def log_transition_probabilities(death_rate, birth_rate, mutation_rate, move):
+
+    total_rate = death_rate + birth_rate + mutation_rate
+    
+    if total_rate == 0:
+        return 0.0
+        
+    P_birth = birth_rate / total_rate
+    P_death = death_rate / total_rate
+    P_no_change = 1 - P_birth - P_death
+
+    # die,sex,mut,plus,drift
+    
+    if np.array_equal(move,[1,0,0,0,0]):
+        return np.log(P_death)
+    elif np.array_equal(move,[0,1,0,0,0]) or np.array_equal(move,[0,0,0,1,0]):
+        return np.log(P_birth)
+    else:
+        return np.log(P_no_change)
 
 @ray.remote(num_cpus=1)
 class Evolutioner:
-    def __init__(self, model, seed=None, n=1, mode = 'search', burnin = 0.5, output='/', position = 1):
+    def __init__(self, model, seed=None, n=1, mode = 'search', burnin = 0.5, output='/', position = 1, num_bits = 64):
         
         self.rng            = np.random.default_rng(seed)
         self.model          = model
         self.population     = [model.new_point(rng = self.rng) for _ in range(n)]
+        # die,sex,mut,plus,drift
         self.alpha0         = np.array([2,1,1,1,1])
         self.alpha          = self.alpha0.copy()
         self.bounds         = self.model.bounds
         self.burnin_frac    = burnin
-        self.n_bits         = 64
-        self.mutation_rate  = 1.0 / (float(self.n_bits) * len(self.bounds))#
+        self.num_bits       = num_bits
+        self.mutation_rate  = 1.0 / (float(self.num_bits)* len(self.bounds))
+        self.mutation_strength = 0.2
         self.mode           = mode
         self.position       = position
         self.samples        = []
+        self.birth_rate     = (self.alpha0[1]+self.alpha0[3])
+        self.death_rate     = self.alpha0[0]
+        self.drifting_rate  = (self.alpha0[2]+self.alpha0[4])
+        self.total_rate     = self.birth_rate+self.death_rate+self.drifting_rate
         self.setup_output(output)
         
     def setup_output(self, output):
@@ -79,36 +161,43 @@ class Evolutioner:
         
         for gen in range(n_generations):#tqdm(range(n_generations), desc="generation ->", ascii=True, position = self.position):
             
-            logP, trial, move = self.evolve_one_step()
+            logP, trial, move   = self.evolve_one_step()
 
-            if acceptance_rule(logP, logP0, self.rng):
+            #if gen < self.burnin:
+            #    acceptance_rule = search_rule
+            #else:
+            #    acceptance_rule = metropolis_hastings
+
+            if acceptance_rule(logP, logP0, self.rng, self.death_rate, self.birth_rate, self.drifting_rate, move):
                 self.population = copy.deepcopy(trial)
                 logP0           = logP
-                self.alpha     += move
                 acc            += 1
+                self.alpha     += move
+                print('generation {0:3d}/{1:4d} - acc {2:0.3f} - best population = {3:3d} - log_post = {4:.5f} - b = {5:.5f} - d = {6:.5f} - m = {7:.5f} moves = {8}'.format(gen+1,
+                       n_generations,acc/float(acc+rej),len(self.population),logP0,
+                       self.birth_rate/self.total_rate,self.death_rate/self.total_rate,self.drifting_rate/self.total_rate,self.alpha))
+                self.N = len(self.population)
+                
                 if gen > self.burnin:
 #                    self.samples.append(trial)
                     self.group.create_dataset('{0:d}'.format(gen), data = np.row_stack([t.values for t in trial]))
-            
+                #else:
+                #    self.alpha += move
+                #    self.birth_rate     = (self.alpha[1]+self.alpha[3])
+                #    self.death_rate     = self.alpha[0]
+                #    self.drifting_rate  = (self.alpha[2]+self.alpha[4])
+                #    self.total_rate     = self.birth_rate+self.death_rate+self.drifting_rate
             else:
                 rej += 1
-            
-            birth_rate = self.alpha[0]/gen
-            death_rate = self.alpha[1]/gen
-            print('generation {0:3d}/{1:4d} - acc {2:0.3f} - best population = {3:3d} - log_post = {4:.5f} - birth rate = {5:.5f} - death rate = {6:.5f}'.format(gen+1,n_generations,acc/float(acc+rej),len(self.population),logP0,birth_rate,death_rate))
-            self.N = len(self.population)
+           
         sys.stderr.write('\n')
         
-
         self.file.close()
         return self.population
 
     def evolve_one_step(self):
         """
         evolve a random individual from the population
-        TODO:
-            death probability should take into account low amplitudes
-            local wander step
         """
         population = copy.deepcopy(self.population)
         N = len(population)
@@ -123,7 +212,7 @@ class Evolutioner:
             if sex == 1:
                 child = self.crossover(p, population[self.rng.integers(0,len(population))])
                 population.append(child)
-                logP = self.model.log_likelihood(population)
+                logP = self.model.log_posterior(population)
                 child.logL = logP
                 child.logP = 1
                 return logP, population, np.array((die,sex,mut,plus,drift))
@@ -164,15 +253,16 @@ class Evolutioner:
         y = x.copy()
         
         for i in range(len(y.values)):
-            v = list(float2bin(y.values[i]))
-            g = self.rng.choice([True, False], len(v), p=[self.mutation_rate,1-self.mutation_rate])
 
+            v = list(map_to_bit_string(x.values[i], self.bounds[i][0], self.bounds[i][1], self.num_bits)) #list(float2bin(y.values[i]))
+            g = self.rng.choice([True, False], len(v), p=[self.mutation_rate,1-self.mutation_rate])
+            
             for j in range(len(v)):
                 if g[j]:
                     v[j] = str(1-int(v[j]))
 
-            y.values[i] = bin2float(''.join(v))
-            
+            y.values[i] = map_bit_string_to_real(''.join(v), self.bounds[i][0], self.bounds[i][1], self.num_bits)
+
         return y
 
     def crossover(self, x, y):
@@ -182,11 +272,11 @@ class Evolutioner:
         z = self.model.new_point(rng = self.rng)
         for i in range(len(x.values)):
 
-            v1   = list(float2bin(x.values[i]))
-            v2   = list(float2bin(y.values[i]))
+            v1   = list(map_to_bit_string(x.values[i], self.bounds[i][0], self.bounds[i][1], self.num_bits))
+            v2   = list(map_to_bit_string(y.values[i], self.bounds[i][0], self.bounds[i][1], self.num_bits))
             idx  = self.rng.choice([True, False], len(v1))
             f    = ''.join(np.where(idx, v1, v2))
-            z.values[i] = bin2float(f)
+            z.values[i] = map_bit_string_to_real(''.join(f), self.bounds[i][0], self.bounds[i][1], self.num_bits)
         
         return z
 
@@ -195,10 +285,11 @@ class Evolutioner:
         gaussian drift the genome
         """
         y = x.copy()
-        
-        for i in range(len(y.values)):
-            dx = np.abs(self.bounds[i][0]-self.bounds[i][1])/100.
-            g = self.rng.normal(0.0, self.mutation_rate*dx)
-            y.values[i] += g
+        D = len(y.values)
+        for i in range(D):
+            if self.rng.uniform() < self.mutation_rate:
+                #dx = 1e-3*np.abs(self.bounds[i][0]-self.bounds[i][1])
+                g  = self.rng.normal(0.0, self.mutation_strength)
+                y.values[i] *= (1+g) 
 
         return y
